@@ -43,11 +43,32 @@ struct pn533_spi_phy {
                  */
 };
 
+static int pn533_spi_send_ack(struct pn533 *dev, gfp_t flags)
+{
+    struct pn533_spi_phy *phy = dev->phy;
+    struct spi_device *spi_dev = phy->spi_dev;
+    static const u8 ack[6] = {0x00, 0x00, 0xff, 0x00, 0xff, 0x00};
+    /* spec 6.2.1.3:  Preamble, SoPC (2), ACK Code (2), Postamble */
+    int rc;
+
+    rc = spi_write(spi_dev, ack, 6);
+
+    if (rc >= 0) {
+        if (rc != 6)
+            rc = -EREMOTEIO;
+        else
+            rc = 0;
+    }
+
+    return rc;
+}
+
+
 static int pn533_spi_send_frame(struct pn533 *dev,
                 struct sk_buff *out)
 {
     struct pn533_spi_phy *phy = dev->phy;
-    struct spi_client *client = phy->i2c_dev;
+    struct spi_device *spi_dev = phy->spi_dev;
     int rc;
 
     if (phy->hard_fault != 0)
@@ -58,14 +79,14 @@ static int pn533_spi_send_frame(struct pn533 *dev,
 
     phy->aborted = false;
 
-    print_hex_dump_debug("PN533_i2c TX: ", DUMP_PREFIX_NONE, 16, 1,
+    print_hex_dump_debug("PN533_SPI: ", DUMP_PREFIX_NONE, 16, 1,
                  out->data, out->len, false);
 
-    rc = spy_write(de, out->data, out->len);
+    rc = spi_write(spi_dev, out->data, out->len);
 
     if (rc == -EREMOTEIO) { /* Retry, chip was in power down */
         usleep_range(6000, 10000);
-        rc = i2c_master_send(client, out->data, out->len);
+        rc = spi_write(spi_dev, out->data, out->len);
     }
 
     if (rc >= 0) {
@@ -77,6 +98,60 @@ static int pn533_spi_send_frame(struct pn533 *dev,
 
     return rc;
 }
+
+
+
+
+
+static int pn533_spi_read(struct pn533_i2c_phy *phy, struct sk_buff **skb)
+{
+    struct pn533_spi_phy *phy = phy;
+    int len = PN533_EXT_FRAME_HEADER_LEN +
+          PN533_STD_FRAME_MAX_PAYLOAD_LEN +
+          PN533_STD_FRAME_TAIL_LEN + 1;
+    int r;
+
+    *skb = alloc_skb(len, GFP_KERNEL);
+    if (*skb == NULL)
+        return -ENOMEM;
+    
+    r = spi_read(phy->spi_dev, skb_put(*skb, len), len);
+    if (r != len) {
+        nfc_err(&phy->spi_dev->dev, "cannot read. r=%d len=%d\n", r, len);
+        kfree_skb(*skb);
+        return -EREMOTEIO;
+    }
+
+    if (!((*skb)->data[0] & 0x01)) {
+        nfc_err(&phy->spi_dev->dev, "READY flag not set");
+        kfree_skb(*skb);
+        return -EBUSY;
+    }
+
+    /* remove READY byte */
+    skb_pull(*skb, 1);
+    /* trim to frame size */
+    skb_trim(*skb, phy->priv->ops->rx_frame_size((*skb)->data));
+
+    return 0;
+}
+
+
+static void pn533_spi_abort_cmd(struct pn533 *dev, gfp_t flags)
+{
+    struct pn533_spi_phy *phy = dev->phy;
+
+    phy->aborted = true;
+
+    /* An ack will cancel the last issued command */
+    pn533_spi_send_ack(dev, flags);
+
+    /* schedule cmd_complete_work to finish current command execution */
+    pn533_recv_frame(phy->priv, NULL, -ENOENT);
+}
+
+
+
 
 static const struct of_device_id of_pn533_spi_match[] = {
     { .compatible = "nxp,pn533-spi" },
@@ -154,44 +229,4 @@ static int pn533_spi_probe(struct spi_device *client)
 
 
 
-
-
-    /* Initialize the driver data */
-    spidev->spi = spi;
-    spin_lock_init(&spidev->spi_lock);// initialization spin lock
-    mutex_init(&spidev->buf_lock);// initialization Mutex lock
-    INIT_LIST_HEAD(&spidev->device_entry);// initialization device chain table
-
-    //init fp_data
-    fp_data = kzalloc(sizeof(struct gsl_fp_data), GFP_KERNEL);
-    if(fp_data == NULL){
-        status = -ENOMEM;
-        return status;
-    }
-    //set fp_data struct value
-    fp_data->spidev = spidev;
-
-    mutex_lock(&device_list_lock);//upper Mutex lock
-    minor = find_first_zero_bit(minors, N_SPI_MINORS);//search the first bit whose value is 0 in the memory area
-    if (minor < N_SPI_MINORS) {
-        struct device *dev;
-        spidev->devt = MKDEV(spidev_major, minor);
-        dev = device_create(spidev_class, &spi->dev, spidev->devt, spidev, "silead_fp_dev"); create device node under /dev/
-        status = IS_ERR(dev) ? PTR_ERR(dev) : 0;
-    } else {
-        dev_dbg(&spi->dev, "no minor number available!\n");
-        status = -ENODEV;
-    }
-    if (status == 0) {
-        set_bit(minor, minors);
-        list_add(&spidev->device_entry, &device_list);//add to device chain table
-    }
-    mutex_unlock(&device_list_lock);//unlock Mutex lock
-    if (status == 0)
-        spi_set_drvdata(spi, spidev);
-    else
-        kfree(spidev);
-    printk("%s:name=%s,bus_num=%d,cs=%d,mode=%d,speed=%d\n",__func__,spi->modalias, spi->master->bus_num, spi->chip_select, spi->mode, 
-    spi->max_speed_hz);//print SPI information
-    return status;
 }
